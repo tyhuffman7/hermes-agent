@@ -179,6 +179,44 @@ class TestModelSwitchPersistence:
         assert result.api_key == "test-key"
         assert result.base_url == "https://api.anthropic.com"
 
+    def test_switch_model_strips_opencode_go_v1_for_minimax_live_switch(self, monkeypatch):
+        """/model should normalize OpenCode Go MiniMax base_url for live Anthropic-mode switches."""
+        import hermes_cli.model_switch as ms
+        from hermes_cli.model_switch import switch_model
+
+        monkeypatch.setattr("hermes_cli.models.detect_provider_for_model", lambda *a, **k: None)
+        monkeypatch.setattr("hermes_cli.models.validate_requested_model", lambda *a, **k: {
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "message": None,
+        })
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": requested or "opencode-go",
+                "api_key": "test-key",
+                "base_url": "https://opencode.ai/zen/go/v1",
+                "api_mode": "chat_completions",
+            },
+        )
+        monkeypatch.setattr(ms, "normalize_model_for_provider", lambda model, provider: model)
+        monkeypatch.setattr(ms, "get_model_capabilities", lambda *a, **k: None)
+        monkeypatch.setattr(ms, "get_model_info", lambda *a, **k: None)
+
+        result = switch_model(
+            raw_input="minimax-m2.7",
+            current_provider="opencode-go",
+            current_model="glm-5",
+            current_base_url="https://opencode.ai/zen/go/v1",
+            current_api_key="test-key",
+        )
+
+        assert result.success is True
+        assert result.new_model == "minimax-m2.7"
+        assert result.api_mode == "anthropic_messages"
+        assert result.base_url == "https://opencode.ai/zen/go"
+
 
 # ---------------------------------------------------------------------------
 # /model tab completion

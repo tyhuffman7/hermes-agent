@@ -709,6 +709,15 @@ def switch_model(
     # --- OpenCode api_mode override ---
     if target_provider in {"opencode-zen", "opencode-go", "opencode", "opencode-go"}:
         api_mode = opencode_model_api_mode(target_provider, new_model)
+        # OpenCode Anthropic-mode models expect the Anthropic SDK to append
+        # /v1/messages itself. Live /model switches must mirror
+        # runtime_provider.resolve_runtime_provider() and strip the trailing
+        # /v1 from the stored base_url, otherwise the running session keeps the
+        # OpenAI-style /v1 base and hits the wrong endpoint.
+        if api_mode == "anthropic_messages" and base_url:
+            base_url = base_url.rstrip("/")
+            if base_url.endswith("/v1"):
+                base_url = base_url[:-3]
 
     # --- Determine api_mode if not already set ---
     if not api_mode:
