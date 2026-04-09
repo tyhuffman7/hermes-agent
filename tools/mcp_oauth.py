@@ -126,20 +126,24 @@ def _is_interactive() -> bool:
 
 def _can_open_browser() -> bool:
     """Return True if opening a browser is likely to work."""
-    # Explicit SSH session → no local display
-    if os.environ.get("SSH_CLIENT") or os.environ.get("SSH_TTY"):
-        return False
-    # macOS and Windows usually have a display
-    if os.name == "nt":
-        return True
-    try:
-        if os.uname().sysname == "Darwin":
+    force_enable = os.environ.get("HERMES_MCP_OPEN_BROWSER", "").strip().lower()
+    if force_enable in {"1", "true", "yes", "on"}:
+        # Explicit SSH session → no local display
+        if os.environ.get("SSH_CLIENT") or os.environ.get("SSH_TTY"):
+            return False
+        # macOS and Windows usually have a display
+        if os.name == "nt":
             return True
-    except AttributeError:
-        pass
-    # Linux/other posix: need DISPLAY or WAYLAND_DISPLAY
-    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
-        return True
+        try:
+            if os.uname().sysname == "Darwin":
+                return True
+        except AttributeError:
+            pass
+        # Linux/other posix: need DISPLAY or WAYLAND_DISPLAY
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            return True
+
+    # Default to manual URL opening for MCP OAuth.
     return False
 
 
@@ -465,13 +469,14 @@ def build_oauth_auth(
         _write_json(storage._client_info_path(), client_info.model_dump(exclude_none=True))
         logger.debug("Pre-registered client_id=%s for '%s'", client_id, server_name)
 
-    # --- Base URL for discovery ---
-    parsed = urlparse(server_url)
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
-
     # --- Build provider ---
+    # Preserve the full MCP server URL (including path like /v1/mcp).
+    # The MCP SDK uses server_url for resource URL derivation and path-aware
+    # metadata discovery. Stripping to scheme://host loses important path
+    # context and can break standards-based OAuth discovery for servers like
+    # Atlassian.
     provider = OAuthClientProvider(
-        server_url=base_url,
+        server_url=server_url,
         client_metadata=client_metadata,
         storage=storage,
         redirect_handler=_redirect_handler,

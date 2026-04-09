@@ -6,6 +6,8 @@ from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
 
+import httpx
+
 import pytest
 
 from tools.mcp_oauth import (
@@ -169,6 +171,17 @@ class TestBuildOAuthAuth:
         assert provider is not None
         assert provider.context.client_metadata.scope == "read write admin"
 
+    def test_preserves_full_server_url(self, tmp_path, monkeypatch):
+        try:
+            from mcp.client.auth import OAuthClientProvider
+        except ImportError:
+            pytest.skip("MCP SDK auth not available")
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        provider = build_oauth_auth("atlassian", "https://mcp.atlassian.com/v1/mcp")
+        assert provider is not None
+        assert provider.context.server_url == "https://mcp.atlassian.com/v1/mcp"
+
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -200,11 +213,13 @@ class TestUtilities:
         monkeypatch.setattr(os, "uname", lambda: type("", (), {"sysname": "Linux"})())
         assert _can_open_browser() is False
 
-    def test_can_open_browser_true_with_display(self, monkeypatch):
+    def test_can_open_browser_true_with_display_when_forced(self, monkeypatch):
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.setenv("DISPLAY", ":0")
+        monkeypatch.setenv("HERMES_MCP_OPEN_BROWSER", "1")
         monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(os, "uname", lambda: type("", (), {"sysname": "Linux"})())
         assert _can_open_browser() is True
 
 
@@ -431,3 +446,66 @@ class TestBuildOAuthAuthNonInteractive:
 
         assert auth is not None
         assert "no cached tokens found" not in caplog.text.lower()
+
+
+class TestMcpSdkRefreshDiscovery:
+    @pytest.mark.asyncio
+    async def test_refresh_discovers_metadata_before_building_request(self, tmp_path, monkeypatch):
+        try:
+            from mcp.client.auth import OAuthClientProvider
+            from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+        except ImportError:
+            pytest.skip("MCP SDK auth not available")
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("atlassian")
+        provider = OAuthClientProvider(
+            server_url="https://mcp.atlassian.com/v1/mcp",
+            client_metadata=OAuthClientMetadata.model_validate({
+                "client_name": "Hermes Agent",
+                "redirect_uris": ["http://127.0.0.1:9999/callback"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+            }),
+            storage=storage,
+        )
+        provider._initialized = True
+        provider.context.current_tokens = OAuthToken.model_validate({
+            "access_token": "expired-access",
+            "refresh_token": "refresh-token",
+            "token_type": "Bearer",
+        })
+        provider.context.client_info = OAuthClientInformationFull.model_validate({
+            "client_id": "client-id",
+            "redirect_uris": ["http://127.0.0.1:9999/callback"],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        })
+        provider.context.token_expiry_time = -1
+
+        request = httpx.Request("POST", "https://mcp.atlassian.com/v1/mcp")
+        flow = provider.async_auth_flow(request)
+
+        try:
+            discovery_request = await flow.__anext__()
+            assert str(discovery_request.url) == "https://mcp.atlassian.com/.well-known/oauth-authorization-server"
+
+            discovery_response = httpx.Response(
+                200,
+                request=discovery_request,
+                json={
+                    "issuer": "https://mcp.atlassian.com",
+                    "authorization_endpoint": "https://mcp.atlassian.com/v1/authorize",
+                    "token_endpoint": "https://cf.mcp.atlassian.com/v1/token",
+                    "registration_endpoint": "https://mcp.atlassian.com/v1/register",
+                },
+            )
+            refresh_request = await flow.asend(discovery_response)
+            assert str(refresh_request.url) == "https://cf.mcp.atlassian.com/v1/token"
+            assert refresh_request.content.decode() == (
+                "grant_type=refresh_token&refresh_token=refresh-token&client_id=client-id"
+            )
+        finally:
+            await flow.aclose()
