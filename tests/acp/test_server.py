@@ -17,9 +17,11 @@ from acp.schema import (
     InitializeResponse,
     ListSessionsResponse,
     LoadSessionResponse,
+    ModelInfo,
     NewSessionResponse,
     PromptResponse,
     ResumeSessionResponse,
+    SessionModelState,
     SetSessionConfigOptionResponse,
     SetSessionModeResponse,
     SessionInfo,
@@ -175,6 +177,21 @@ class TestSessionOps:
         mock_schedule.assert_called_once_with(resp.session_id)
 
     @pytest.mark.asyncio
+    async def test_new_session_returns_models_field(self, agent):
+        models_state = SessionModelState(
+            current_model_id="gpt-5.4",
+            available_models=[
+                ModelInfo(model_id="gpt-5.4", name="gpt-5.4 (OpenAI Codex)", description="Via OpenAI Codex")
+            ],
+        )
+        with patch.object(agent, "_get_session_model_state", return_value=models_state):
+            resp = await agent.new_session(cwd="/home/user/project")
+
+        assert isinstance(resp.models, SessionModelState)
+        assert resp.models.current_model_id == "gpt-5.4"
+        assert resp.models.available_models[0].model_id == "gpt-5.4"
+
+    @pytest.mark.asyncio
     async def test_cancel_sets_event(self, agent):
         resp = await agent.new_session(cwd=".")
         state = agent.session_manager.get_session(resp.session_id)
@@ -206,6 +223,22 @@ class TestSessionOps:
     async def test_load_session_not_found_returns_none(self, agent):
         resp = await agent.load_session(cwd="/tmp", session_id="bogus")
         assert resp is None
+
+    @pytest.mark.asyncio
+    async def test_load_and_resume_return_models_field(self, agent):
+        models_state = SessionModelState(
+            current_model_id="gpt-5.4",
+            available_models=[
+                ModelInfo(model_id="gpt-5.4", name="gpt-5.4 (OpenAI Codex)", description="Via OpenAI Codex")
+            ],
+        )
+        resp = await agent.new_session(cwd="/tmp")
+        with patch.object(agent, "_get_session_model_state", return_value=models_state):
+            load_resp = await agent.load_session(cwd="/tmp", session_id=resp.session_id)
+            resume_resp = await agent.resume_session(cwd="/tmp", session_id=resp.session_id)
+
+        assert isinstance(load_resp.models, SessionModelState)
+        assert isinstance(resume_resp.models, SessionModelState)
 
     @pytest.mark.asyncio
     async def test_resume_session_returns_response(self, agent):
@@ -289,6 +322,125 @@ class TestSessionConfiguration:
         assert resp.config_options == []
 
     @pytest.mark.asyncio
+    async def test_set_config_option_model_switch_preserves_existing_agent(self, agent):
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        original_agent = state.agent
+        original_agent.model = "gpt-5.4"
+        original_agent.provider = "openai-codex"
+
+        def _fake_switch_model(new_model, new_provider, api_key="", base_url="", api_mode=""):
+            original_agent.model = new_model
+            original_agent.provider = new_provider
+            original_agent.api_key = api_key
+            original_agent.base_url = base_url
+            original_agent.api_mode = api_mode
+
+        original_agent.switch_model = MagicMock(side_effect=_fake_switch_model)
+
+        with patch.object(agent.session_manager, "_make_agent", wraps=agent.session_manager._make_agent) as mock_make_agent:
+            resp = await agent.set_config_option(
+                config_id="model",
+                session_id=new_resp.session_id,
+                value="copilot:gpt-5.3-codex",
+            )
+
+        assert isinstance(resp, SetSessionConfigOptionResponse)
+        assert state.agent is original_agent
+        assert state.agent.model == "gpt-5.3-codex"
+        assert state.agent.provider == "github-copilot"
+        original_agent.switch_model.assert_called_once()
+        mock_make_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_set_session_model_switches_provider_runtime(self, agent):
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        original_agent = state.agent
+        original_agent.model = "gpt-5.4"
+        original_agent.provider = "openai-codex"
+
+        def _fake_switch_model(new_model, new_provider, api_key="", base_url="", api_mode=""):
+            original_agent.model = new_model
+            original_agent.provider = new_provider
+            original_agent.api_key = api_key
+            original_agent.base_url = base_url
+            original_agent.api_mode = api_mode
+
+        original_agent.switch_model = MagicMock(side_effect=_fake_switch_model)
+
+        with patch.object(agent.session_manager, "_make_agent", wraps=agent.session_manager._make_agent) as mock_make_agent:
+            resp = await agent.set_session_model(
+                model_id="opencode-go:minimax-m2.7",
+                session_id=new_resp.session_id,
+            )
+
+        assert resp is not None
+        assert state.agent is original_agent
+        assert state.agent.model == "minimax-m2.7"
+        assert state.agent.provider == "opencode-go"
+        assert state.agent.api_mode == "anthropic_messages"
+        assert state.agent.base_url == "https://opencode.ai/zen/go"
+        original_agent.switch_model.assert_called_once()
+        mock_make_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_set_config_option_copilot_claude_uses_messages_api(self, agent):
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.agent.model = "gpt-5.4"
+        state.agent.provider = "openai-codex"
+
+        def _fake_switch_model(new_model, new_provider, api_key="", base_url="", api_mode=""):
+            state.agent.model = new_model
+            state.agent.provider = new_provider
+            state.agent.api_key = api_key
+            state.agent.base_url = base_url
+            state.agent.api_mode = api_mode
+
+        state.agent.switch_model = MagicMock(side_effect=_fake_switch_model)
+
+        resp = await agent.set_config_option(
+            config_id="model",
+            session_id=new_resp.session_id,
+            value="copilot:claude-opus-4.6",
+        )
+
+        assert isinstance(resp, SetSessionConfigOptionResponse)
+        assert state.agent.model == "claude-opus-4.6"
+        assert state.agent.provider == "github-copilot"
+        assert state.agent.api_mode == "chat_completions"
+        assert state.agent.base_url == "https://api.githubcopilot.com"
+        state.agent.switch_model.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_session_model_state_keeps_duplicate_models_distinct_by_provider(self, agent):
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.agent.model = "gpt-5.4"
+        state.agent.provider = "openai-codex"
+
+        with patch.object(
+            agent,
+            "_get_available_providers_with_models",
+            return_value={"copilot": ["gpt-5.4"], "openai-codex": ["gpt-5.4"]},
+        ):
+            models_state = agent._get_session_model_state("gpt-5.4", state=state)
+            config_options = agent._get_model_config_options("gpt-5.4", state=state)
+
+        assert models_state is not None
+        assert models_state.current_model_id == "openai-codex:gpt-5.4"
+        assert [m.model_id for m in models_state.available_models] == [
+            "copilot:gpt-5.4",
+            "openai-codex:gpt-5.4",
+        ]
+        assert config_options[0].current_value == "openai-codex:gpt-5.4"
+        assert [opt.value for opt in config_options[0].options] == [
+            "copilot:gpt-5.4",
+            "openai-codex:gpt-5.4",
+        ]
+
+    @pytest.mark.asyncio
     async def test_router_accepts_stable_session_config_methods(self, agent):
         new_resp = await agent.new_session(cwd="/tmp")
         router = build_agent_router(agent)
@@ -330,6 +482,25 @@ class TestSessionConfiguration:
 # ---------------------------------------------------------------------------
 # prompt
 # ---------------------------------------------------------------------------
+
+
+class TestProviderDiscovery:
+    def test_get_available_providers_with_models_reads_credential_pool(self, agent, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        hermes_home = tmp_path / ".hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        hermes_home.mkdir()
+        (hermes_home / "auth.json").write_text(
+            '{"providers": {"openai-codex": {}}, "credential_pool": {"copilot": [], "opencode-go": []}}'
+        )
+
+        provider_models = agent._get_available_providers_with_models()
+
+        assert "openai-codex" in provider_models
+        assert "copilot" in provider_models
+        assert "opencode-go" in provider_models
+        assert provider_models["copilot"]
+        assert provider_models["opencode-go"]
 
 
 class TestPrompt:

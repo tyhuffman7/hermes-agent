@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Deque, Optional
 
 import acp
@@ -26,11 +28,13 @@ from acp.schema import (
     McpServerHttp,
     McpServerSse,
     McpServerStdio,
+    ModelInfo,
     NewSessionResponse,
     PromptResponse,
     ResumeSessionResponse,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
+    SessionModelState,
     SetSessionConfigOptionResponse,
     SetSessionModelResponse,
     SetSessionModeResponse,
@@ -265,97 +269,174 @@ class HermesACPAgent(acp.Agent):
 
     # ---- Model config options for ACP clients (e.g., Multicoder) ------------
 
-    def _get_model_config_options(self, current_model: str = "") -> list[SessionConfigOptionSelect]:
-        """Build config options for model selection based on user's configured providers.
-        
-        This enables Multicoder and other ACP clients to show a native model switcher.
-        Only includes models from providers the user has actually configured.
-        """
+    def _get_available_providers_with_models(self) -> dict[str, list[str]]:
+        """Return provider -> model IDs using the shared CLI model-switch logic."""
         try:
-            from hermes_cli.models import (
-                list_available_providers,
-                curated_models_for_provider,
-                normalize_provider,
-            )
-            from hermes_cli.config import load_config
+            from hermes_cli.model_switch import list_authenticated_providers
+            from hermes_cli.models import curated_models_for_provider, normalize_provider
         except Exception:
-            # Fallback if modules not available
+            return {}
+
+        current_provider = ""
+        try:
+            current_provider = getattr(getattr(self, "session_manager", None), "current_provider", "") or ""
+        except Exception:
+            current_provider = ""
+
+        result: dict[str, list[str]] = {}
+        try:
+            providers = list_authenticated_providers(current_provider=current_provider, max_models=200)
+        except Exception:
+            providers = []
+
+        discovered_provider_ids: set[str] = set()
+        for info in providers:
+            provider_id = normalize_provider(str(info.get("slug") or "").strip())
+            if not provider_id:
+                continue
+            discovered_provider_ids.add(provider_id)
+            try:
+                models = [mid for mid, _ in curated_models_for_provider(provider_id)]
+            except Exception:
+                models = list(info.get("models") or [])
+            if models:
+                result[provider_id] = models
+
+        # Fallback: merge providers found only in auth.json/credential_pool so ACP
+        # still sees API-key-backed providers even when list_authenticated_providers()
+        # lacks enough environment/context to surface them in test or editor sessions.
+        try:
+            from hermes_constants import get_hermes_home
+            from hermes_cli.models import normalize_provider
+
+            auth_path = get_hermes_home() / "auth.json"
+            if auth_path.exists():
+                auth = json.loads(auth_path.read_text())
+                provider_ids = set((auth.get("providers") or {}).keys()) | set((auth.get("credential_pool") or {}).keys())
+                for provider_id in provider_ids:
+                    canonical = normalize_provider(provider_id)
+                    if canonical in discovered_provider_ids or canonical in result:
+                        continue
+                    try:
+                        models = [mid for mid, _ in curated_models_for_provider(canonical)]
+                    except Exception:
+                        models = []
+                    if models:
+                        result[canonical] = models
+        except Exception:
+            pass
+
+        return result
+
+    def _encode_model_choice(self, provider_id: str, model_id: str) -> str:
+        """Encode ACP model selections with provider identity preserved."""
+        return f"{provider_id}:{model_id}"
+
+    def _current_model_choice_id(self, state: SessionState | None, current_model: str = "") -> str:
+        """Return the ACP model choice id for the current session state."""
+        if not isinstance(current_model, str) or not current_model:
+            current_model = getattr(getattr(state, "agent", None), "model", "") or ""
+        provider_id = getattr(getattr(state, "agent", None), "provider", None) or ""
+        if provider_id and current_model:
+            return self._encode_model_choice(provider_id, current_model)
+        return current_model or ""
+
+    def _get_session_model_state(
+        self,
+        current_model: str = "",
+        state: SessionState | None = None,
+    ) -> SessionModelState | None:
+        """Build ACP SessionModelState for native client model dropdowns."""
+        try:
+            from hermes_cli.providers import get_label
+        except Exception:
+            return None
+
+        provider_models_map = self._get_available_providers_with_models()
+        if not provider_models_map:
+            return None
+
+        available_models: list[ModelInfo] = []
+        for provider_id, models in provider_models_map.items():
+            provider_label = get_label(provider_id)
+            for model_id in models:
+                if not isinstance(model_id, str) or not model_id:
+                    continue
+                display_id = model_id.split("/")[-1] if "/" in model_id else model_id
+                available_models.append(
+                    ModelInfo(
+                        model_id=self._encode_model_choice(provider_id, model_id),
+                        name=f"{display_id} ({provider_label})",
+                        description=f"Via {provider_label}",
+                    )
+                )
+
+        if not available_models:
+            return None
+
+        current_choice = self._current_model_choice_id(state, current_model)
+        if not current_choice:
+            current_choice = available_models[0].model_id
+
+        return SessionModelState(
+            current_model_id=current_choice,
+            available_models=available_models,
+        )
+
+    def _get_model_config_options(
+        self,
+        current_model: str = "",
+        state: SessionState | None = None,
+    ) -> list[SessionConfigOptionSelect]:
+        """Build ACP config options for model selection from configured providers."""
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.providers import get_label
+        except Exception:
             return []
-        
-        # Get providers the user has authenticated/configured
-        all_providers = list_available_providers()
-        authenticated_providers = [p for p in all_providers if p.get("authenticated")]
-        
-        if not authenticated_providers:
-            # No providers configured, return empty list
+
+        provider_models_map = self._get_available_providers_with_models()
+        if not provider_models_map:
             return []
-        
-        # Load Hermes config to get default model settings
+
         try:
             config = load_config()
-            default_model_config = config.get("model", {})
+            default_model_config = config.get("model", {}) if isinstance(config, dict) else {}
         except Exception:
             default_model_config = {}
-        
-        # Build list of model options from all authenticated providers
+
         model_options: list[SessionConfigSelectOption] = []
-        seen_models = set()
-        
-        for provider_info in authenticated_providers:
-            provider_id = provider_info["id"]
-            provider_label = provider_info.get("label", provider_id)
-            
-            # Get models available for this provider
-            try:
-                provider_models = curated_models_for_provider(provider_id)
-            except Exception:
-                provider_models = []
-            
-            # For custom endpoints that don't expose a models API, check config for default model
-            if provider_id == "custom" and not provider_models:
-                default_model = default_model_config.get("default", "")
-                if default_model and default_model not in seen_models:
-                    provider_models = [(default_model, f"Default model for {provider_label}")]
-            
-            for model_id, desc in provider_models:
-                if model_id in seen_models:
+        for provider_id, models in provider_models_map.items():
+            provider_label = get_label(provider_id)
+            for model_id in models:
+                if not isinstance(model_id, str) or not model_id:
                     continue
-                seen_models.add(model_id)
-                
-                # Create display name: "model-name (Provider)"
-                # Strip provider prefix if present (e.g., "anthropic/claude-opus" -> "claude-opus")
-                display_id = model_id
-                if "/" in model_id:
-                    display_id = model_id.split("/")[-1]
-                
-                display_name = f"{display_id} ({provider_label})"
-                
-                # Truncate description if too long
-                description = desc if desc else f"Via {provider_label}"
-                if len(description) > 50:
-                    description = description[:47] + "..."
-                
-                model_options.append(SessionConfigSelectOption(
-                    value=model_id,
-                    name=display_name,
-                    description=description,
-                ))
-        
-        # If no current model specified, use config default or first available
-        if not current_model:
-            current_model = default_model_config.get("default", "")
-        
-        if not current_model and model_options:
-            current_model = model_options[0].value
-        
+                display_id = model_id.split("/")[-1] if "/" in model_id else model_id
+                model_options.append(
+                    SessionConfigSelectOption(
+                        value=self._encode_model_choice(provider_id, model_id),
+                        name=f"{display_id} ({provider_label})",
+                        description=f"Via {provider_label}"[:50],
+                    )
+                )
+
+        current_choice = self._current_model_choice_id(state, current_model)
+        if not current_choice:
+            default_model = default_model_config.get("default", "") if isinstance(default_model_config, dict) else ""
+            default_provider = default_model_config.get("provider", "") if isinstance(default_model_config, dict) else ""
+            if default_model and default_provider:
+                current_choice = self._encode_model_choice(default_provider, default_model)
+        if not current_choice and model_options:
+            current_choice = model_options[0].value
+
         return [
             SessionConfigOptionSelect(
                 id="model",
                 name="Model",
-                description=f"AI model to use ({len(authenticated_providers)} provider(s) configured)",
-                category="model",  # This tells ACP clients to show as model selector
+                description=f"AI model ({len(provider_models_map)} provider(s))",
+                category="model",
                 type="select",
-                current_value=current_model,
+                current_value=current_choice,
                 options=model_options,
             )
         ]
@@ -375,11 +456,13 @@ class HermesACPAgent(acp.Agent):
         
         # Get current model from agent and expose model selector to ACP clients
         current_model = getattr(state.agent, "model", "")
-        config_options = self._get_model_config_options(current_model)
-        
+        config_options = self._get_model_config_options(current_model, state=state)
+        models_state = self._get_session_model_state(current_model, state=state)
+
         return NewSessionResponse(
             session_id=state.session_id,
             config_options=config_options,
+            models=models_state,
         )
 
     async def load_session(
@@ -399,9 +482,10 @@ class HermesACPAgent(acp.Agent):
         
         # Expose model selector to ACP clients when loading session
         current_model = getattr(state.agent, "model", "")
-        config_options = self._get_model_config_options(current_model)
-        
-        return LoadSessionResponse(config_options=config_options)
+        config_options = self._get_model_config_options(current_model, state=state)
+        models_state = self._get_session_model_state(current_model, state=state)
+
+        return LoadSessionResponse(config_options=config_options, models=models_state)
 
     async def resume_session(
         self,
@@ -420,9 +504,10 @@ class HermesACPAgent(acp.Agent):
         
         # Expose model selector to ACP clients when resuming session
         current_model = getattr(state.agent, "model", "")
-        config_options = self._get_model_config_options(current_model)
-        
-        return ResumeSessionResponse(config_options=config_options)
+        config_options = self._get_model_config_options(current_model, state=state)
+        models_state = self._get_session_model_state(current_model, state=state)
+
+        return ResumeSessionResponse(config_options=config_options, models=models_state)
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         state = self.session_manager.get_session(session_id)
@@ -668,32 +753,68 @@ class HermesACPAgent(acp.Agent):
         return "\n".join(lines)
 
     def _switch_model(self, state: SessionState, new_model: str) -> tuple[str, str]:
-        """Switch the model for a session. Returns (new_model, provider_label)."""
-        target_provider = None
+        """Switch the model for a session using the shared CLI /model pipeline."""
         current_provider = getattr(state.agent, "provider", None) or "openrouter"
+        current_model = getattr(state.agent, "model", "") or state.model or ""
+        current_base_url = getattr(state.agent, "base_url", "") or ""
+        current_api_key = getattr(state.agent, "api_key", "") or ""
 
-        # Auto-detect provider for the requested model
+        raw_input = str(new_model or "").strip()
+        explicit_provider = ""
+        if ":" in raw_input:
+            left, right = raw_input.split(":", 1)
+            if left.strip() and right.strip():
+                explicit_provider = left.strip()
+                raw_input = right.strip()
+
         try:
-            from hermes_cli.models import parse_model_input, detect_provider_for_model
-            target_provider, new_model = parse_model_input(new_model, current_provider)
-            if target_provider == current_provider:
-                detected = detect_provider_for_model(new_model, current_provider)
-                if detected:
-                    target_provider, new_model = detected
-        except Exception:
-            logger.debug("Provider detection failed, using model as-is", exc_info=True)
+            from hermes_cli.model_switch import switch_model as shared_switch_model
 
-        state.model = new_model
-        state.agent = self.session_manager._make_agent(
-            session_id=state.session_id,
-            cwd=state.cwd,
-            model=new_model,
-            requested_provider=target_provider or current_provider,
-        )
+            result = shared_switch_model(
+                raw_input=raw_input,
+                current_provider=current_provider,
+                current_model=current_model,
+                current_base_url=current_base_url,
+                current_api_key=current_api_key,
+                explicit_provider=explicit_provider,
+            )
+        except Exception as exc:
+            logger.exception("ACP model switch failed during shared pipeline")
+            raise RuntimeError(f"ACP model switch failed: {exc}") from exc
+
+        if not result.success:
+            raise RuntimeError(result.error_message or "model switch failed")
+
+        switch_model = getattr(state.agent, "switch_model", None)
+        if callable(switch_model):
+            switch_model(
+                result.new_model,
+                result.target_provider,
+                api_key=result.api_key,
+                base_url=result.base_url,
+                api_mode=result.api_mode,
+            )
+        else:
+            state.agent.model = result.new_model
+            state.agent.provider = result.target_provider
+            if result.base_url:
+                state.agent.base_url = result.base_url
+            if result.api_mode:
+                state.agent.api_mode = result.api_mode
+            if result.api_key:
+                state.agent.api_key = result.api_key
+            invalidate = getattr(state.agent, "_invalidate_system_prompt", None)
+            if callable(invalidate):
+                invalidate()
+
+        state.model = result.new_model
         self.session_manager.save_session(state.session_id)
-        provider_label = getattr(state.agent, "provider", None) or target_provider or current_provider
-        logger.info("Session %s: model switched to %s", state.session_id, new_model)
-        return new_model, provider_label
+        logger.info(
+            "Session %s: model switched to %s via shared model_switch pipeline",
+            state.session_id,
+            result.new_model,
+        )
+        return result.new_model, getattr(state.agent, "provider", None) or result.target_provider
 
     def _cmd_model(self, args: str, state: SessionState) -> str:
         if not args:
@@ -798,24 +919,38 @@ class HermesACPAgent(acp.Agent):
     ) -> SetSessionModelResponse | None:
         """Switch the model for a session (called by ACP protocol)."""
         state = self.session_manager.get_session(session_id)
-        if state:
-            state.model = model_id
-            current_provider = getattr(state.agent, "provider", None)
-            current_base_url = getattr(state.agent, "base_url", None)
-            current_api_mode = getattr(state.agent, "api_mode", None)
-            state.agent = self.session_manager._make_agent(
-                session_id=session_id,
-                cwd=state.cwd,
-                model=model_id,
-                requested_provider=current_provider,
-                base_url=current_base_url,
-                api_mode=current_api_mode,
+        if state is None:
+            logger.warning("Session %s: model switch requested for missing session", session_id)
+            return None
+
+        current_provider = getattr(state.agent, "provider", None) or "openrouter"
+        explicit_provider = False
+        try:
+            from hermes_cli.models import parse_model_input
+
+            parsed_provider, parsed_model = parse_model_input(model_id, current_provider)
+            explicit_provider = parsed_model != model_id or parsed_provider != current_provider
+        except Exception:
+            parsed_provider, parsed_model = current_provider, model_id
+
+        if explicit_provider:
+            new_model, provider_label = self._switch_model(state, model_id)
+            logger.info(
+                "Session %s: model switched via ACP to %s (provider=%s)",
+                session_id,
+                new_model,
+                provider_label,
             )
-            self.session_manager.save_session(session_id)
-            logger.info("Session %s: model switched to %s", session_id, model_id)
             return SetSessionModelResponse()
-        logger.warning("Session %s: model switch requested for missing session", session_id)
-        return None
+
+        state.model = model_id
+        state.agent.model = model_id
+        invalidate = getattr(state.agent, "_invalidate_system_prompt", None)
+        if callable(invalidate):
+            invalidate()
+        self.session_manager.save_session(session_id)
+        logger.info("Session %s: model switched via ACP to %s", session_id, model_id)
+        return SetSessionModelResponse()
 
     async def set_session_mode(
         self, mode_id: str, session_id: str, **kwargs: Any
@@ -845,7 +980,7 @@ class HermesACPAgent(acp.Agent):
             new_model, provider_label = self._switch_model(state, value)
             # Return updated config options with the new current model
             return SetSessionConfigOptionResponse(
-                config_options=self._get_model_config_options(new_model)
+                config_options=self._get_model_config_options(new_model, state=state)
             )
 
         # For other config options, just store them
