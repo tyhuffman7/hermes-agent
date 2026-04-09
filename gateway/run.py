@@ -2836,7 +2836,10 @@ class GatewayRunner:
                 # Normalize underscores to hyphens so Telegram's underscored
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
+                plugin_handler = get_plugin_command_handler(
+                    command.replace("_", "-"),
+                    platform=source.platform.value if source.platform else "gateway",
+                )
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
                     import asyncio as _aio

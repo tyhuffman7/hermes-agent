@@ -113,6 +113,7 @@ class LoadedPlugin:
     module: Optional[types.ModuleType] = None
     tools_registered: List[str] = field(default_factory=list)
     hooks_registered: List[str] = field(default_factory=list)
+    commands_registered: List[str] = field(default_factory=list)
     enabled: bool = False
     error: Optional[str] = None
 
@@ -244,6 +245,75 @@ class PluginContext:
             self.manifest.name, engine.name,
         )
 
+    def get_cli(self):
+        """Return the active CLI instance when running inside the terminal UI."""
+        return self._manager._cli_ref
+
+    def register_command(
+        self,
+        name: str,
+        handler: Callable,
+        description: str = "Plugin command",
+        aliases: tuple[str, ...] = (),
+        args_hint: str = "",
+        subcommands: tuple[str, ...] = (),
+        category: str = "Tools & Skills",
+        cli_only: bool = True,
+        gateway_only: bool = False,
+    ) -> None:
+        """Register a slash command exposed through the normal Hermes command UI."""
+        from hermes_cli.commands import CommandDef, register_plugin_command, resolve_command
+
+        canonical = (name or "").strip().lstrip("/").lower()
+        if not canonical:
+            raise ValueError("Plugin command name cannot be empty")
+
+        normalized_aliases = tuple(
+            alias.strip().lstrip("/").lower()
+            for alias in aliases
+            if alias and alias.strip().lstrip("/")
+        )
+
+        if resolve_command(canonical):
+            raise ValueError(f"Plugin command '{canonical}' conflicts with an existing command")
+        if canonical in self._manager._plugin_commands or canonical in self._manager._plugin_command_aliases:
+            raise ValueError(f"Plugin command '{canonical}' is already registered")
+
+        for alias in normalized_aliases:
+            if alias == canonical:
+                raise ValueError(f"Plugin command alias '{alias}' duplicates its command name")
+            if resolve_command(alias):
+                raise ValueError(f"Plugin command alias '{alias}' conflicts with an existing command")
+            if alias in self._manager._plugin_commands or alias in self._manager._plugin_command_aliases:
+                raise ValueError(f"Plugin command alias '{alias}' is already registered")
+
+        cmd_def = CommandDef(
+            name=canonical,
+            description=description,
+            category=category,
+            aliases=normalized_aliases,
+            args_hint=args_hint,
+            subcommands=subcommands,
+            cli_only=cli_only,
+            gateway_only=gateway_only,
+        )
+        register_plugin_command(cmd_def)
+
+        self._manager._plugin_commands[canonical] = {
+            "handler": handler,
+            "cli_only": cli_only,
+            "gateway_only": gateway_only,
+            "plugin": self.manifest.name,
+        }
+        for alias in normalized_aliases:
+            self._manager._plugin_command_aliases[alias] = canonical
+
+        loaded = self._manager._plugins.get(self.manifest.name)
+        if loaded is not None:
+            loaded.commands_registered.append(canonical)
+
+        logger.debug("Plugin %s registered slash command: %s", self.manifest.name, canonical)
+
     # -- hook registration --------------------------------------------------
 
     def register_hook(self, hook_name: str, callback: Callable) -> None:
@@ -275,6 +345,8 @@ class PluginManager:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
+        self._plugin_commands: Dict[str, dict] = {}
+        self._plugin_command_aliases: Dict[str, str] = {}
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._discovered: bool = False
@@ -550,6 +622,7 @@ class PluginManager:
                     "enabled": loaded.enabled,
                     "tools": len(loaded.tools_registered),
                     "hooks": len(loaded.hooks_registered),
+                    "commands": len(loaded.commands_registered),
                     "error": loaded.error,
                 }
             )
@@ -587,6 +660,27 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 def get_plugin_tool_names() -> Set[str]:
     """Return the set of tool names registered by plugins."""
     return get_plugin_manager()._plugin_tool_names
+
+
+def get_plugin_command_handler(name: str, platform: str = "cli") -> Callable | None:
+    """Return a plugin slash-command handler, resolving aliases and platform scope."""
+    manager = get_plugin_manager()
+    if not manager._discovered:
+        manager.discover_and_load()
+
+    normalized = (name or "").strip().lstrip("/").lower()
+    if not normalized:
+        return None
+
+    canonical = manager._plugin_command_aliases.get(normalized, normalized)
+    entry = manager._plugin_commands.get(canonical)
+    if not entry:
+        return None
+    if entry.get("cli_only") and platform != "cli":
+        return None
+    if entry.get("gateway_only") and platform == "cli":
+        return None
+    return entry.get("handler")
 
 
 def get_plugin_cli_commands() -> Dict[str, dict]:
